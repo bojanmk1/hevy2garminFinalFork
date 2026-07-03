@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader
 
 from hevy2garmin import db, __version__
+from hevy2garmin.db_interface import NoWritableDatabaseError
 from hevy2garmin.auth import auth_enabled, verify_session, sign_session, check_password, SESSION_COOKIE
 from hevy2garmin.config import is_configured, load_config, save_config
 from hevy2garmin.demo import is_demo_mode
@@ -55,6 +56,37 @@ def _render(template_name: str, **ctx) -> HTMLResponse:
 
 app = FastAPI(title="hevy2garmin", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+_NO_DB_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hevy2garmin — database needed</title>
+<style>
+ body{margin:0;background:#0f1115;color:#e6e6e6;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center}
+ .card{max-width:560px;margin:24px;padding:32px;background:#171a21;border:1px solid #262b36;border-radius:14px}
+ h1{margin:0 0 4px;font-size:20px}
+ p{color:#aab2c0}
+ ol{padding-left:20px} li{margin:8px 0}
+ code{background:#0f1115;border:1px solid #262b36;border-radius:6px;padding:1px 6px;font-size:14px}
+ a{color:#7aa2ff}
+</style></head><body><div class="card">
+ <h1>Almost there — hevy2garmin needs a database</h1>
+ <p>This deployment has no database attached yet. Serverless hosts have a read-only
+ filesystem, so the app can't fall back to a local file and needs Postgres.</p>
+ <ol>
+  <li>Open your project on <a href="https://vercel.com/dashboard" target="_blank" rel="noopener">Vercel</a>.</li>
+  <li>Go to the <b>Storage</b> tab and add a <b>Neon Postgres</b> database (it's free). This sets <code>POSTGRES_URL</code> automatically.</li>
+  <li>Go to <b>Deployments</b>, open the latest one, and click <b>Redeploy</b>.</li>
+ </ol>
+ <p>Once the database is connected and it redeploys, this page becomes your dashboard.</p>
+</div></body></html>"""
+
+
+@app.exception_handler(NoWritableDatabaseError)
+async def _no_database_handler(request: Request, exc: NoWritableDatabaseError) -> HTMLResponse:
+    """Render an actionable 'add a database' page instead of a raw 500 (#145, #142)."""
+    logger.warning("No writable database on %s: %s", request.url.path, exc)
+    return HTMLResponse(_NO_DB_PAGE, status_code=503)
 
 
 # ── Auto-sync state ─────────────────────────────────────────────────────────
@@ -881,6 +913,7 @@ async def settings_save(
     merge_overlap_pct: int = Form(70),
     merge_max_drift_min: int = Form(20),
     merge_extra_types: str = Form(""),
+    merge_watch_strategy: str = Form("replace"),
 ):
     if is_demo_mode():
         return HTMLResponse('<div class="toast toast-error">Settings are read-only in demo mode</div>')
@@ -911,6 +944,7 @@ async def settings_save(
     config["merge_activity_types"] = ["strength_training"] + [
         t for t in dict.fromkeys(extra_types) if t != "strength_training"
     ]
+    config["merge_watch_strategy"] = merge_watch_strategy if merge_watch_strategy in ("replace", "merge", "describe") else "replace"
     save_config(config)
 
     # Persist settings to DB on cloud (filesystem is read-only on Vercel)
@@ -926,6 +960,7 @@ async def settings_save(
                 "merge_overlap_pct": config["merge_overlap_pct"],
                 "merge_max_drift_min": config["merge_max_drift_min"],
                 "merge_activity_types": config["merge_activity_types"],
+                "merge_watch_strategy": config["merge_watch_strategy"],
             })
         except Exception as e:
             logger.warning("Failed to persist settings to DB: %s", e)
@@ -1263,6 +1298,9 @@ async def api_unsync(request: Request, hevy_id: str):
 async def api_unsync_all(request: Request):
     """Remove ALL sync records. Does not delete from Garmin."""
     from fastapi.responses import JSONResponse
+
+    if is_demo_mode():
+        return JSONResponse({"ok": False, "error": "Read-only in demo mode"}, status_code=403)
 
     form = await request.form()
     confirm = form.get("confirm", "")
@@ -1654,6 +1692,7 @@ async def _do_sync_one(request: Request):
         merge_mode = config.get("merge_mode", True)
         sync_method = "upload"
         merge_forced_fresh = False
+        merge_delete_id = None
 
         # Merge mode: try to enhance a watch-recorded activity with Hevy data
         if merge_mode:
@@ -1662,6 +1701,7 @@ async def _do_sync_one(request: Request):
                 overlap_threshold=config.get("merge_overlap_pct", 70) / 100.0,
                 max_drift_minutes=config.get("merge_max_drift_min", 20),
                 activity_types=set(config.get("merge_activity_types", ["strength_training"])),
+                watch_strategy=config.get("merge_watch_strategy", "replace"),
             )
             if merge_result.merged:
                 aid = merge_result.activity_id
@@ -1683,6 +1723,7 @@ async def _do_sync_one(request: Request):
                 remaining = hevy.get_workout_count() - db.get_synced_count()
                 return JSONResponse({"synced": 1, "title": unsynced["title"], "remaining": max(0, remaining), "done": remaining <= 0})
             merge_forced_fresh = merge_result.force_fresh_upload
+            merge_delete_id = merge_result.delete_after_upload
 
         # HR enrichment for the uploaded FIT (#158): merged HR (AirPods-preferred,
         # watch fill), best-effort. Computed after the merge early-return so the
@@ -1715,6 +1756,15 @@ async def _do_sync_one(request: Request):
                 result = generate_fit(unsynced, hr_samples=hr_samples, output_path=fit_path)
                 upload_result = upload_fit(garmin_client, fit_path, workout_start=workout_start)
                 aid = upload_result.get("activity_id")
+                if aid and merge_delete_id:
+                    # "replace" strategy (#159): named upload succeeded, delete the
+                    # watch recording so the workout is a single activity.
+                    try:
+                        from hevy2garmin.garmin import delete_activity
+                        delete_activity(garmin_client, merge_delete_id)
+                        logger.info("Removed watch copy %s (replaced by %s)", merge_delete_id, aid)
+                    except Exception as e:
+                        logger.warning("Could not delete watch activity %s: %s", merge_delete_id, e)
                 if aid:
                     rename_activity(garmin_client, aid, unsynced["title"])
                     desc = generate_description(unsynced, calories=result.get("calories"), avg_hr=result.get("avg_hr"))
