@@ -360,3 +360,48 @@ class SQLiteDatabase(Database):
         """, (hevy_id, garmin_activity_id, status, reason, source))
         conn.execute("DELETE FROM pending_uploads WHERE hevy_id=?", (hevy_id,))
         conn.commit(); conn.close()
+
+    def get_workout_states(self, hevy_ids: list[str]) -> dict[str, dict]:
+        if not hevy_ids:
+            return {}
+        placeholders = ",".join("?" for _ in hevy_ids)
+        conn = self._get_conn(); conn.row_factory = sqlite3.Row
+        terminal = conn.execute(
+            f"SELECT hevy_id, status, garmin_activity_id, resolution_reason, resolution_source FROM synced_workouts WHERE hevy_id IN ({placeholders})",
+            hevy_ids,
+        ).fetchall()
+        states = {
+            row["hevy_id"]: {
+                "kind": "terminal", "status": row["status"] or "success",
+                "garmin_activity_id": row["garmin_activity_id"],
+                "reason": row["resolution_reason"], "source": row["resolution_source"],
+            }
+            for row in terminal
+        }
+        try:
+            pending = conn.execute(
+                f"SELECT hevy_id, phase, next_step, last_error, attempt_count, delete_attempt_count, garmin_activity_id FROM pending_uploads WHERE hevy_id IN ({placeholders})",
+                hevy_ids,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            pending = []
+        conn.close()
+        for row in pending:
+            if row["hevy_id"] not in states:
+                states[row["hevy_id"]] = {
+                    "kind": "pending", "status": row["phase"],
+                    "next_step": row["next_step"], "last_error": row["last_error"],
+                    "attempt_count": row["attempt_count"],
+                    "delete_attempt_count": row["delete_attempt_count"],
+                    "garmin_activity_id": row["garmin_activity_id"],
+                }
+        return states
+
+    def get_terminal_counts(self) -> dict[str, int]:
+        conn = self._get_conn()
+        rows = conn.execute("SELECT COALESCE(status, 'success'), COUNT(*) FROM synced_workouts GROUP BY COALESCE(status, 'success')").fetchall()
+        conn.close()
+        raw = dict(rows)
+        result = {"uploaded": raw.get("success", 0), "manual": raw.get("manual", 0), "skipped": raw.get("skipped", 0)}
+        result["terminal"] = sum(result.values())
+        return result

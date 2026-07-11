@@ -124,3 +124,11 @@ class Database(ABC):
         source: str | None = None,
     ) -> None:
         """Atomically create a manual/skipped terminal state and clear pending."""
+
+    @abstractmethod
+    def get_workout_states(self, hevy_ids: list[str]) -> dict[str, dict]:
+        """Batch-fetch terminal and pending state with terminal precedence."""
+
+    @abstractmethod
+    def get_terminal_counts(self) -> dict[str, int]:
+        """Return uploaded, manual, skipped, and total terminal counts."""

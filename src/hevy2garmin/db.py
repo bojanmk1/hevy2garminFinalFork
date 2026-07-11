@@ -175,3 +175,11 @@ def complete_pending(hevy_id: str, terminal: dict, **kw) -> None:
 
 def resolve_terminal(hevy_id: str, **kwargs) -> None:
     return get_db().resolve_terminal(hevy_id, **kwargs)
+
+
+def get_workout_states(hevy_ids: list[str], **kw) -> dict[str, dict]:
+    return get_db().get_workout_states(hevy_ids)
+
+
+def get_terminal_counts(**kw) -> dict[str, int]:
+    return get_db().get_terminal_counts()
